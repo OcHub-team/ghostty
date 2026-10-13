@@ -278,3 +278,10 @@ test "ghostty_config_trigger: default keybind" {
         try testing.expectEqual(.unidentified, trigger.key.physical);
     }
 }
+
+export fn ghostty_config_load_string(self: *Config, bytes: [*]const u8, len: usize) void {
+    var reader: std.Io.Reader = .fixed(bytes[0..len]);
+    self.loadReader(global.alloc(), &reader, "<embedded>") catch |err| {
+        log.err("error loading embedded config err={}", .{err});
+    };
+}

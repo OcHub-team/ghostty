@@ -17,6 +17,7 @@
 //! enable threading, use the Thread struct. This wraps a Termio, requires
 //! specific backend/mailbox capabilities, and sets up the necessary threads.
 
+pub const Manual = @import("termio/Manual.zig");
 const stream_handler = @import("termio/stream_handler.zig");
 
 const message = @import("termio/message.zig");

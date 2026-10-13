@@ -64,6 +64,7 @@ mailbox: termio.Mailbox,
 /// The stream parser. This parses the stream of escape codes and so on
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
+suppress_terminal_responses: bool,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
@@ -324,6 +325,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write = opts.config.clipboard_write,
         .clipboard_write_limit = opts.config.clipboard_write_limit,
         .enquiry_response = opts.config.enquiry_response,
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
         .xt_checksum_report = opts.config.xt_checksum_report,
     };
 
@@ -348,6 +350,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .handler = handler,
         }),
         .thread_enter_state = thread_enter_state,
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
     };
 }
 
@@ -561,6 +564,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    if (self.suppress_terminal_responses) return;
     const grid_size = self.size.grid();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
@@ -675,7 +679,7 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
     self.renderer_state.mutex.unlock(global.io());
 
     // If we have focus events enabled, we send the focus event.
-    if (focus_event) {
+    if (focus_event and !self.suppress_terminal_responses) {
         var buf: [terminalpkg.focus.max_encode_size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buf);
         terminalpkg.focus.encode(&writer, if (focused) .gained else .lost) catch |err| {
@@ -773,6 +777,7 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
+    if (self.suppress_terminal_responses) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }

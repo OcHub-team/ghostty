@@ -297,44 +297,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// `buf_count` structs that can hold the
             /// data needed by the GPU to draw a frame.
             frames: [buf_count]FrameState,
-            /// Index of the most recently used frame state struct.
-            frame_index: std.math.IntFittingRange(0, buf_count) = 0,
-            /// Semaphore that we wait on to make sure we have an available
-            /// frame state struct so we can start working on a new frame.
-            frame_sema: std.Io.Semaphore = .{ .permits = buf_count },
-
+            leases: renderer.frame_lease.Pool(buf_count) = .{},
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
-                var result: SwapChain = .{ .frames = undefined };
-
-                // Initialize all of our frame state.
+                var result: SwapChain = .{ .frames = undefined, .leases = .{ .io = global.io() } };
+                var count: usize = 0;
+                errdefer for (result.frames[0..count]) |*frame| frame.deinit();
                 for (&result.frames) |*frame| {
                     frame.* = try FrameState.init(api, custom_shaders);
+                    count += 1;
                 }
-
                 return result;
             }
-
             pub fn deinit(self: *SwapChain) void {
-                // Wait for all of our inflight draws to complete
-                // so that we can cleanly deinit our GPU state.
-                for (0..buf_count) |_| self.frame_sema.waitUncancelable(
-                    global.io(),
-                );
-                for (&self.frames) |*frame| frame.deinit();
+                self.leases.beginDeinit();
+                for (0..buf_count) |_| {
+                    const i = self.leases.takeForDeinit(null) catch unreachable;
+                    self.frames[i].deinit();
+                }
             }
-
-            /// Get the next frame state to draw to. This will wait on the
-            /// semaphore to ensure that the frame is available. This must
-            /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(self: *SwapChain) *FrameState {
-                self.frame_sema.waitUncancelable(global.io());
-                self.frame_index = (self.frame_index + 1) % buf_count;
-                return &self.frames[self.frame_index];
-            }
-
-            /// This should be called when the frame has completed drawing.
-            pub fn releaseFrame(self: *SwapChain) void {
-                self.frame_sema.post(global.io());
+            const Acquired = struct { state: *FrameState, token: renderer.frame_lease.Token };
+            pub fn nextFrame(self: *SwapChain) !Acquired {
+                const lease = try self.leases.acquire(null);
+                return .{ .state = &self.frames[lease.slot], .token = lease.token };
             }
         };
 
@@ -1777,8 +1761,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.cells_rebuilt = false;
 
             // Wait for a frame to be available.
-            const frame = swap_chain.nextFrame();
-            errdefer swap_chain.releaseFrame();
+            const acquired = try swap_chain.nextFrame();
+            const frame = acquired.state;
+            errdefer assert(swap_chain.leases.finish(acquired.token, false));
             // log.debug("drawing frame index={}", .{swap_chain.frame_index});
 
             // If we need to reinitialize our shaders, do so.
@@ -1873,7 +1858,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = try self.api.beginFrame(self, &frame.target);
+            const external_context = if (@hasDecl(GraphicsAPI, "externalFrameContext")) self.api.externalFrameContext() else 0;
+            var frame_ctx = try self.api.beginFrame(self, &frame.target, acquired.token, external_context);
             defer frame_ctx.complete(sync);
 
             {
@@ -2014,6 +2000,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn frameCompleted(
             self: *Self,
             health: Health,
+            token: renderer.frame_lease.Token,
+            host_acquired: bool,
         ) void {
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
@@ -2031,7 +2019,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // guaranteed to exist here: it is only torn down after
             // waiting for all in-flight frames to complete, and this
             // callback is what signals that completion.
-            self.swap_chain.?.releaseFrame();
+            assert(self.swap_chain.?.leases.finish(token, host_acquired));
+        }
+
+        pub fn beginExternalFramePresentation(self: *Self, token: renderer.frame_lease.Token) bool {
+            return self.swap_chain.?.leases.beginPresentation(token);
+        }
+        pub fn releaseExternalFrame(self: *Self, token: renderer.frame_lease.Token) bool {
+            // A valid host lease prevents this swap chain from being destroyed.
+            return if (self.swap_chain) |*sc| sc.leases.releaseHost(token) else false;
         }
 
         /// Call this any time the background image path changes.

@@ -16,11 +16,29 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
 
+fn suppressTerminalResponse(enabled: bool, msg: termio.Message) bool {
+    if (!enabled) return false;
+    switch (msg) {
+        .write_small,
+        .write_stable,
+        .color_scheme_report,
+        .size_report,
+        .focused,
+        => return true,
+        .write_alloc => |req| {
+            req.alloc.free(req.data);
+            return true;
+        },
+        else => return false,
+    }
+}
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
 /// unless all of the member fields are copied.
 pub const StreamHandler = struct {
+    suppress_terminal_responses: bool = false,
     alloc: Allocator,
     size: *renderer.Size,
     terminal: *terminal.Terminal,
@@ -147,6 +165,8 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
+            return;
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -2021,4 +2041,51 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+test "terminal response suppression drops every parser reply class" {
+    const testing = std.testing;
+
+    // Device attributes and status reports use the stable and small write
+    // variants respectively.
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .write_stable = "\x1b[?62;22c" },
+    ));
+
+    var dsr: termio.Message = .{ .write_small = .{} };
+    const dsr_bytes = "\x1b[12;34R";
+    @memcpy(dsr.write_small.data[0..dsr_bytes.len], dsr_bytes);
+    dsr.write_small.len = dsr_bytes.len;
+    try testing.expect(suppressTerminalResponse(true, dsr));
+
+    // OSC and DCS replies can exceed the inline message storage and therefore
+    // exercise the allocating variant. The suppression path owns and frees it.
+    const long_osc_reply: []const u8 = "\x1b]4;0;rgb:00/00/00;1;rgb:ff/ff/ff;2;rgb:00/00/00;3;rgb:ff/ff/ff\x1b\\";
+    const osc = try termio.Message.writeReq(testing.allocator, long_osc_reply);
+    try testing.expect(suppressTerminalResponse(true, osc));
+
+    try testing.expect(!suppressTerminalResponse(
+        false,
+        .{ .write_stable = "reply" },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .size_report = .csi_18_t },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .color_scheme_report = .{ .force = true } },
+    ));
+    try testing.expect(suppressTerminalResponse(
+        true,
+        .{ .focused = true },
+    ));
+
+    // State-changing parser messages are never terminal replies and must
+    // continue to reach the Termio side in mirror mode.
+    try testing.expect(!suppressTerminalResponse(
+        true,
+        .{ .linefeed_mode = true },
+    ));
 }

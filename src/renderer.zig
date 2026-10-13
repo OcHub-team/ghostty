@@ -7,6 +7,8 @@
 //! APIs. The renderers in this package assume that the renderer is already
 //! setup (OpenGL has a context, Vulkan has a surface, etc.)
 
+pub const external_frame = @import("renderer/external_frame.zig");
+pub const frame_lease = @import("renderer/frame_lease.zig");
 const build_config = @import("build_config.zig");
 
 const cursor = @import("renderer/cursor.zig");
@@ -60,6 +62,8 @@ test {
     // Our comptime-chosen renderer
     _ = Renderer;
 
+    _ = external_frame;
+    _ = frame_lease;
     _ = cursor;
     _ = message;
     _ = shadertoy;

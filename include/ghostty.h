@@ -70,6 +70,7 @@ typedef enum {
   GHOSTTY_PLATFORM_INVALID,
   GHOSTTY_PLATFORM_MACOS,
   GHOSTTY_PLATFORM_IOS,
+  GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED = 5,
 } ghostty_platform_e;
 
 typedef enum {
@@ -494,7 +495,53 @@ typedef struct {
   void* uiview;
 } ghostty_platform_ios_s;
 
+typedef enum {
+  // Ghostty may immediately reuse the frame's exact swap-chain slot.
+  GHOSTTY_METAL_EXTERNAL_FRAME_DROP = 0,
+  // The embedder owns a lease until it releases frame_token.
+  GHOSTTY_METAL_EXTERNAL_FRAME_ACQUIRE = 1,
+} ghostty_metal_external_frame_disposition_e;
+
+typedef enum {
+  GHOSTTY_METAL_EXTERNAL_COLOR_SPACE_DISPLAY_P3 = 0,
+} ghostty_metal_external_color_space_e;
+
+typedef struct {
+  // Borrowed for the callback, and kept alive by Ghostty after ACQUIRE until
+  // the matching frame_token is released.
+  void* iosurface;
+  // Nonzero identity for this exact acquisition of this swap-chain slot.
+  uint64_t frame_token;
+  // Opaque value captured when Ghostty began drawing this frame.
+  uint64_t host_context;
+  uint32_t width_px;
+  uint32_t height_px;
+  ghostty_metal_external_color_space_e color_space;
+} ghostty_metal_external_frame_s;
+
+/**
+ * Called after Metal finishes rendering a leased external frame.
+ *
+ * This callback runs on a Metal command-buffer completion thread and must be
+ * thread-safe and non-blocking. Returning ACQUIRE keeps this exact IOSurface
+ * swap-chain slot alive until ghostty_surface_release_external_frame is called
+ * with frame_token. Returning DROP permits immediate reuse. Releases may occur
+ * on any thread and in any order while the surface remains alive. Every
+ * acquired frame must be released before ghostty_surface_free; surface teardown
+ * may wait for outstanding leases so it cannot free an IOSurface in use.
+ */
+typedef ghostty_metal_external_frame_disposition_e
+    (*ghostty_metal_external_present_leased_cb)(
+        void* userdata,
+        const ghostty_metal_external_frame_s* frame);
+
+typedef struct {
+  void* userdata;
+  ghostty_metal_external_present_leased_cb present;
+} ghostty_platform_metal_external_leased_s;
+
 typedef union {
+  ghostty_platform_metal_external_leased_s metal_external_leased;
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
 } ghostty_platform_u;
@@ -504,6 +551,9 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_TAB = 1,
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
+
+typedef enum { GHOSTTY_SURFACE_IO_EXEC = 0, GHOSTTY_SURFACE_IO_MANUAL = 1, GHOSTTY_SURFACE_IO_MANUAL_MIRROR = 2 } ghostty_surface_io_mode_e;
+typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
 typedef struct {
   ghostty_platform_e platform_tag;
@@ -518,6 +568,10 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  ghostty_surface_io_mode_e io_mode;
+  ghostty_io_write_cb io_write_cb;
+  void* io_write_userdata;
+  uintptr_t scrollback_limit_bytes;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1177,6 +1231,14 @@ GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
 GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
+// OcHerdr embedding extensions. Rebuild bindings together with this library.
+GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t);
+GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(ghostty_app_t, const ghostty_surface_config_s*, uintptr_t);
+GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t, uint16_t, uint16_t, ghostty_surface_size_s*);
+GHOSTTY_API void ghostty_surface_set_external_frame_context(ghostty_surface_t, uint64_t);
+GHOSTTY_API bool ghostty_surface_release_external_frame(ghostty_surface_t, uint64_t);
+GHOSTTY_API bool ghostty_surface_select_viewport_rows(ghostty_surface_t, uint16_t, uint16_t);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);

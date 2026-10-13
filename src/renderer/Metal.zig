@@ -39,7 +39,8 @@ pub const swap_chain_count = 3;
 
 const log = std.log.scoped(.metal);
 
-layer: IOSurfaceLayer,
+layer: ?IOSurfaceLayer,
+external: ?*apprt.Surface = null,
 
 /// The shared render device.
 device: *const Device,
@@ -70,6 +71,13 @@ pub fn init(
     const queue = mtl_device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
     errdefer queue.release();
 
+    if (opts.rt_surface.platform == .metal_external_leased) return .{
+        .layer = null,
+        .external = opts.rt_surface,
+        .device = device,
+        .queue = queue,
+        .blending = opts.config.blending,
+    };
     const ViewInfo = struct {
         view: objc.Object,
         scaleFactor: f64,
@@ -82,6 +90,7 @@ pub fn init(
             .view = switch (opts.rt_surface.platform) {
                 .macos => |v| v.nsview,
                 .ios => |v| v.uiview,
+                .metal_external_leased => unreachable,
             },
         },
 
@@ -142,12 +151,13 @@ pub fn deinit(self: *Metal) void {
     // The MTLDevice is app-scoped and destroyed
     // by the render device, not by us.
 
-    self.layer.release();
+    if (self.layer) |*layer| layer.release();
 }
 
 pub fn loopEnter(self: *Metal) void {
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
-    self.layer.setDisplayCallback(
+    const layer = if (self.layer) |*layer| layer else return;
+    layer.setDisplayCallback(
         @ptrCast(&displayCallback),
         @ptrCast(renderer),
     );
@@ -198,8 +208,12 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
-    const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
-    const scale = self.layer.layer.getProperty(f64, "contentsScale");
+    if (self.external) |surface| return .{
+        .width = @min(surface.size.width, self.device.max_texture_size),
+        .height = @min(surface.size.height, self.device.max_texture_size),
+    };
+    const bounds = self.layer.?.layer.getProperty(graphics.Rect, "bounds");
+    const scale = self.layer.?.layer.getProperty(f64, "contentsScale");
 
     // We need to clamp our runtime surface size to the maximum
     // possible texture size since we can't create a screen buffer (texture)
@@ -234,12 +248,25 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 }
 
 /// Present the provided target.
-pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
-    if (sync) {
-        self.layer.setSurfaceSync(target.surface);
-    } else {
-        try self.layer.setSurface(target.surface);
+pub inline fn present(self: *Metal, renderer: *Renderer, target: Target, sync: bool, token: rendererpkg.frame_lease.Token, context: u64) !bool {
+    if (self.external) |surface| {
+        if (!renderer.beginExternalFramePresentation(token)) return false;
+        const config = surface.platform.metal_external_leased;
+        const frame: rendererpkg.external_frame.Frame = .{
+            .iosurface = @ptrCast(target.surface),
+            .frame_token = token,
+            .host_context = context,
+            .width_px = @intCast(target.width),
+            .height_px = @intCast(target.height),
+            .color_space = .display_p3,
+        };
+        return config.present(config.userdata, &frame) == .acquire;
     }
+    if (sync) self.layer.?.setSurfaceSync(target.surface) else try self.layer.?.setSurface(target.surface);
+    return false;
+}
+pub fn externalFrameContext(self: *const Metal) u64 {
+    return if (self.external) |surface| surface.externalFrameContext() else 0;
 }
 
 /// Returns the options to use when constructing buffers.
@@ -382,6 +409,8 @@ pub inline fn beginFrame(
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    token: rendererpkg.frame_lease.Token,
+    context: u64,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    return try Frame.begin(.{ .queue = self.queue }, renderer, target, token, context);
 }

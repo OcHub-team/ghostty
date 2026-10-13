@@ -4,6 +4,7 @@
 //! example for the macOS build of Ghostty so that we can use a native
 //! Swift+XCode-based application.
 
+const termio = @import("../termio.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
@@ -379,9 +380,18 @@ pub const App = struct {
 };
 
 /// Platform-specific configuration for libghostty.
+pub const ExternalFrame = renderer.external_frame.Frame;
+pub const ExternalFrameDisposition = renderer.external_frame.Disposition;
+
 pub const Platform = union(PlatformTag) {
+    metal_external_leased: MetalExternalLeased,
     macos: MacOS,
     ios: IOS,
+
+    pub const MetalExternalLeased = struct {
+        userdata: ?*anyopaque,
+        present: *const fn (?*anyopaque, *const ExternalFrame) callconv(.c) ExternalFrameDisposition,
+    };
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -398,6 +408,10 @@ pub const Platform = union(PlatformTag) {
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
+        metal_external_leased: extern struct {
+            userdata: ?*anyopaque,
+            present: ?*const fn (?*anyopaque, *const ExternalFrame) callconv(.c) ExternalFrameDisposition,
+        },
         macos: extern struct {
             nsview: ?*anyopaque,
         },
@@ -411,6 +425,10 @@ pub const Platform = union(PlatformTag) {
     pub fn init(tag_int: c_int, c_platform: C) !Platform {
         const tag = std.enums.fromInt(PlatformTag, tag_int) orelse return error.InvalidEnumTag;
         return switch (tag) {
+            .metal_external_leased => .{ .metal_external_leased = .{
+                .userdata = c_platform.metal_external_leased.userdata,
+                .present = c_platform.metal_external_leased.present orelse return error.MissingPresenter,
+            } },
             .macos => if (MacOS != void) macos: {
                 const config = c_platform.macos;
                 const nsview = objc.Object.fromId(config.nsview orelse
@@ -429,6 +447,7 @@ pub const Platform = union(PlatformTag) {
 };
 
 pub const PlatformTag = enum(c_int) {
+    metal_external_leased = 5,
     // "0" is reserved for invalid so we can detect unset values
     // from the C API.
 
@@ -444,7 +463,14 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+pub const IoMode = enum(c_int) { exec = 0, manual = 1, manual_mirror = 2 };
+pub const IoWriteCallback = termio.Manual.WriteCallback;
+
 pub const Surface = struct {
+    io_mode: IoMode = .exec,
+    io_write_cb: ?IoWriteCallback = null,
+    io_write_userdata: ?*anyopaque = null,
+    external_frame_context: std.atomic.Value(u64) = .init(0),
     app: *App,
     platform: Platform,
     userdata: ?*anyopaque = null,
@@ -457,6 +483,16 @@ pub const Surface = struct {
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
+
+    pub fn usesManualIo(self: *const Surface) bool {
+        return self.io_mode != .exec;
+    }
+    pub fn externalFrameContext(self: *const Surface) u64 {
+        return self.external_frame_context.load(.acquire);
+    }
+    pub fn setExternalFrameContext(self: *Surface, value: u64) void {
+        self.external_frame_context.store(value, .release);
+    }
 
     /// Surface initialization options.
     pub const Options = extern struct {
@@ -499,12 +535,19 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+        io_mode: IoMode = .exec,
+        io_write_cb: ?IoWriteCallback = null,
+        io_write_userdata: ?*anyopaque = null,
+        scrollback_limit_bytes: usize = 0,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
+            .io_mode = opts.io_mode,
+            .io_write_cb = opts.io_write_cb,
+            .io_write_userdata = opts.io_write_userdata,
             .userdata = opts.userdata,
             .core_surface = undefined,
             .content_scale = .{
@@ -522,6 +565,9 @@ pub const Surface = struct {
         // Shallow copy the config so that we can modify it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
+        if (opts.scrollback_limit_bytes > 0) {
+            config.@"scrollback-limit-bytes" = .{ .value = @min(config.@"scrollback-limit-bytes".optional() orelse opts.scrollback_limit_bytes, opts.scrollback_limit_bytes) };
+        }
 
         // If we have a working directory from the options then we set it.
         if (opts.working_directory) |c_wd| {
@@ -682,6 +728,26 @@ pub const Surface = struct {
         };
 
         func(self.userdata, process_alive);
+    }
+
+    pub fn updateGridSize(self: *Surface, columns: u16, rows: u16) bool {
+        const requested: renderer.GridSize = .{
+            .columns = columns,
+            .rows = rows,
+        };
+        const screen = self.core_surface.size.screenForGrid(requested) orelse
+            return false;
+        self.updateSize(screen.width, screen.height);
+
+        // Padding balancing may be recomputed by the core resize. Re-resolve
+        // once with that authoritative padding if necessary.
+        if (!self.core_surface.size.grid().equals(requested)) {
+            const adjusted = self.core_surface.size.screenForGrid(requested) orelse
+                return false;
+            self.updateSize(adjusted.width, adjusted.height);
+        }
+
+        return self.core_surface.size.grid().equals(requested);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -1852,6 +1918,49 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
     ) !*Surface {
         return try app.newSurface(opts.*);
+    }
+
+    export fn ghostty_surface_set_grid_size(
+        surface: *Surface,
+        columns: u16,
+        rows: u16,
+        resolved: ?*SurfaceSize,
+    ) bool {
+        if (!surface.updateGridSize(columns, rows)) return false;
+        if (resolved) |result| result.* = ghostty_surface_size(surface);
+        return true;
+    }
+    export fn ghostty_surface_set_external_frame_context(
+        surface: *Surface,
+        context: u64,
+    ) void {
+        surface.setExternalFrameContext(context);
+    }
+    export fn ghostty_surface_release_external_frame(
+        surface: *Surface,
+        frame_token: u64,
+    ) bool {
+        switch (surface.platform) {
+            .metal_external_leased => {},
+            else => return false,
+        }
+        return surface.core_surface.renderer.releaseExternalFrame(frame_token);
+    }
+    export fn ghostty_surface_process_output(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(ptr[0..len]);
+    }
+    export fn ghostty_surface_new_with_scrollback_limit(app: *App, opts: *const Surface.Options, limit: usize) ?*Surface {
+        var options = opts.*;
+        options.scrollback_limit_bytes = limit;
+        return ghostty_surface_new(app, &options);
+    }
+    export fn ghostty_surface_select_viewport_rows(surface: *Surface, top: u16, bottom: u16) bool {
+        return surface.core_surface.selectViewportRows(top, bottom) catch false;
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {

@@ -4126,7 +4126,7 @@ fn loadFsFile(self: *Config, alloc: Allocator, file: *std.Io.File, path: []const
 }
 
 /// Load config from the given Reader.
-fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []const u8) !void {
+pub fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []const u8) !void {
     bom: {
         // If the file starts with a UTF-8 byte order mark, skip it.
         // https://en.wikipedia.org/wiki/Byte_order_mark#UTF-8
