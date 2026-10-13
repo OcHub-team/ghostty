@@ -5982,8 +5982,8 @@ pub const CompleteClipboard = struct {
     ///
     ///   - For "regular" pasting this means that unsafe pastes are
     ///     allowed. Unsafe data is defined as data that contains
-    ///     newlines, though this definition may change later to detect
-    ///     other scenarios.
+    ///     line terminators (newlines or carriage returns), though
+    ///     this definition may change later to detect other scenarios.
     ///
     ///   - For OSC 52 and Kitty clipboard protocol reads and writes no
     ///     prompt is shown to the user when this is true.

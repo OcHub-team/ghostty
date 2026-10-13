@@ -1,7 +1,7 @@
 # OcHerdr's GhosttyKit integration
 
-This branch starts at upstream `ghostty-org/ghostty` commit
-`a939f771d92d89d16ad7376187e3ec7dda61d191` and adds the embedding APIs needed by
+This branch tracks upstream `ghostty-org/ghostty` commit
+`cc53940b4cf97876e48826e5d825833a77471c89` and adds the embedding APIs needed by
 [OcHerdr](https://github.com/OcHub-team/OcHerdr). This is the development tree for
 the next Ghostty release, not a released Ghostty 1.4 binary. Upstream currently
 identifies the tree as `1.3.2-dev`.
